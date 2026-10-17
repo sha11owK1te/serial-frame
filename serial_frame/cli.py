@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
+import time
 
 from .codec import FrameParser, build_frame
 
@@ -26,8 +27,9 @@ def cmd_parse(args) -> int:
     parser = FrameParser()
     for payload in parser.feed(raw):
         print("payload : %-24s %r" % (_hex(payload), payload.decode("utf-8", "replace")))
-    print("stats   : frames=%d crc_errors=%d discarded=%d pending=%d"
-          % (parser.frames, parser.crc_errors, parser.discarded, parser.pending))
+    print("stats   : frames=%d crc_errors=%d discarded=%d timeouts=%d pending=%d"
+          % (parser.frames, parser.crc_errors, parser.discarded,
+             parser.timeouts, parser.pending))
     return 0
 
 
@@ -57,8 +59,24 @@ def cmd_demo(args) -> int:
         cursor += size
 
     print()
-    print("结果: frames=%d crc_errors=%d discarded=%d pending=%d"
-          % (parser.frames, parser.crc_errors, parser.discarded, parser.pending))
+    print("结果: frames=%d crc_errors=%d discarded=%d timeouts=%d pending=%d"
+          % (parser.frames, parser.crc_errors, parser.discarded,
+             parser.timeouts, parser.pending))
+
+    # 第二幕：对端发到一半就掉线，半帧卡在缓冲区里
+    if args.timeout_ms > 0:
+        print()
+        print("--- 半帧超时 (timeout_ms=%d) ---" % args.timeout_ms)
+        stuck = FrameParser(timeout_ms=args.timeout_ms)
+        frame = build_frame(b"stuck")
+        stuck.feed(frame[:4])
+        print("喂入 %d/%d 字节，pending=%d" % (4, len(frame), stuck.pending))
+        time.sleep(args.timeout_ms / 1000.0 + 0.005)
+        dropped = stuck.tick()
+        print("tick() -> 丢弃 %d 字节，timeouts=%d pending=%d"
+              % (dropped, stuck.timeouts, stuck.pending))
+        print("后续正常帧: %r" % stuck.feed(build_frame(b"alive")))
+
     return 0
 
 
@@ -74,8 +92,10 @@ def main(argv=None) -> int:
     p_parse.add_argument("data")
     p_parse.set_defaults(func=cmd_parse)
 
-    p_demo = sub.add_parser("demo", help="演示粘包 / 半包 / 垃圾数据")
+    p_demo = sub.add_parser("demo", help="演示粘包 / 半包 / 垃圾数据 / 半帧超时")
     p_demo.add_argument("--seed", type=int, default=7)
+    p_demo.add_argument("--timeout-ms", type=int, default=30,
+                        help="半帧超时阈值，0 表示关闭")
     p_demo.set_defaults(func=cmd_demo)
 
     args = parser.parse_args(argv)

@@ -2,130 +2,146 @@
 
 ![CI](https://github.com/sha11owK1te/serial-frame/actions/workflows/ci.yml/badge.svg)
 
-零依赖的串口帧编解码器：构造帧、流式解析、CRC16 校验、半帧超时回收。
+面向 UART 字节流的帧编解码器：**C99 MCU 核心 + Python 上位机参考实现**。
+支持任意拆包、连续多帧、CRC16 校验和可选的半帧超时。
 
-调试串口设备时，真正难的不是协议本身，而是**数据流会被任意切分**——
-一次 `read()` 可能拿到半帧、两帧、或者半帧加一串垃圾字节。
-这个库用流式状态机把「粘包 / 半包 / 错包 / 死包」四种情况处理干净，只用 Python 标准库。
+C 核心不依赖 HAL、RTOS 或动态内存；Python 运行时只使用标准库。
+当前提供主机自动化验证，**尚未完成开发板 UART/DMA 实测**。
 
-## 帧格式
+## 协议
 
-```
-+--------+--------+--------+-----------+--------+
-| 0xAA   | 0x55   | LEN    | PAYLOAD   | CRC16  |
-+--------+--------+--------+-----------+--------+
-  2 byte           1 byte    N byte      2 byte
+```text
+AA 55 | LEN (1 byte) | PAYLOAD (0..255 bytes) | CRC16 (2 bytes, little-endian)
 ```
 
-- `LEN` 为 payload 字节数，范围 0–255
-- `CRC16` 为 CRC-16/MODBUS，覆盖 `LEN + PAYLOAD`，小端存放
+CRC-16/MODBUS：多项式反射值 `0xA001`，初值 `0xFFFF`，xorout `0x0000`，
+覆盖 `LEN + PAYLOAD`。标准校验向量 `123456789 → 0x4B37`。
+最大帧长 260 字节，payload 可包含任意二进制字节，包括 `AA 55`。
 
-## 用法
+## C99 快速开始
+
+将 `c/src/serial_frame.c` 和 `c/include/serial_frame.h` 加入 MCU 工程即可。
+
+```c
+#include "serial_frame.h"
+
+static sf_parser parser; /* 持久保存，不能每次收数据都初始化 */
+
+static void on_frame(const uint8_t *payload, size_t length, void *user)
+{
+    /* 在回调内处理或复制 payload；回调返回后指针内容可能被覆盖。 */
+    (void)payload;
+    (void)length;
+    (void)user;
+}
+
+void app_init(void)
+{
+    (void)sf_init(&parser, 100); /* ms，0 关闭超时 */
+}
+
+void app_receive(const uint8_t *data, size_t length, uint32_t now_ms)
+{
+    (void)sf_feed(&parser, data, length, now_ms, on_frame, NULL);
+}
+
+void app_poll(uint32_t now_ms)
+{
+    (void)sf_tick(&parser, now_ms); /* 没收到数据也应定期调用 */
+}
+```
+
+`sf_build_frame()` 将 payload 编码到调用方提供的缓冲区，返回帧长；
+容量不足或参数非法返回 0。`sf_feed()` 返回本次有效帧数。
+完整 API 约束见 [头文件](c/include/serial_frame.h)。
+
+### 主机构建与测试
+
+需要 C99 编译器及 CMake 3.16+：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+核心持有一个 260 字节帧缓冲区，以及长度、时钟和统计状态；
+实际结构体大小取决于 ABI。逐字节接收，不随传入数据块长度增加内部缓冲容量。
+返回 payload 的回调由调用方负责处理，核心不创建线程、不负责串口收发。
+
+## Python 上位机参考
+
+在仓库根目录运行：
 
 ```python
 from serial_frame import FrameParser, build_frame
 
-frame = build_frame(b"hello")     # b'\xAA\x55\x05hello..'
-
-parser = FrameParser()
-parser.feed(frame[:3])            # 半包 -> []
-parser.feed(frame[3:])            # 补齐 -> [b'hello']
+frame = build_frame(b"hello")
+parser = FrameParser(timeout_ms=100)
+assert parser.feed(frame[:3]) == []
+assert parser.feed(frame[3:]) == [b"hello"]
+parser.tick()  # 接入读循环后，即使没有新数据也要周期调用
 ```
-
-带半帧超时：
-
-```python
-parser = FrameParser(timeout_ms=200)
-
-while running:
-    chunk = ser.read(ser.in_waiting or 1)   # 读不到也要转一圈
-    for payload in parser.feed(chunk):
-        handle(payload)
-    parser.tick()                           # 半帧等太久就丢掉
-```
-
-`feed()` 会返回本次拼出的 payload 列表；`tick()` 返回本次因超时丢弃的字节数。
-两者都幂等，多调几次不会重复计数。
-
-## 命令行
 
 ```bash
-# 打包
 python -m serial_frame.cli build "temp=25.3"
-
-# 解析一段十六进制数据流
-python -m serial_frame.cli parse "AA 55 05 68 65 6C 6C 6F 76 A5"
-
-# 演示：随机切片喂进去，看它怎么把碎片拼回来；末尾再演一次半帧超时
+python -m serial_frame.cli parse "AA 55 05 68 65 6C 6C 6F D2 7A"
 python -m serial_frame.cli demo
-python -m serial_frame.cli demo --timeout-ms 0     # 关掉超时那一幕
-```
-
-`demo` 第一幕打印每一块碎片和对应的解析结果，用来观察粘包与半包的处理过程；
-第二幕喂半帧进去、等过阈值、调 `tick()`，把丢弃的字节数和计数打出来。
-
-## 测试
-
-```bash
 python -m unittest discover -s tests -t . -v
 ```
 
-26 个测试，覆盖：CRC 标准值、空 payload、超长 payload、单帧、粘包、逐字节喂入、
-CRC 错误、垃圾前缀、半包后补齐，以及超时的 15 种情形——
-到期与未到期、`tick()` 与 `feed()` 两种触发路径、计时起点不被新字节刷新、
-超时后仍能正常解析后续帧、计数累加、`reset()` 清零、非法参数拒绝。
+串口适配器应使用有限的读取等待时间，确保 `tick()` 能得到执行。
+Python 中 `timeout_ms=None` 关闭超时，启用时必须为有限正数。
 
-超时测试用**注入的假时钟**（`FrameParser(timeout_ms=50, clock=fake)`），
-不靠 `sleep`。整套测试跑完 0.001s，也不会因为 CI 机器卡顿而偶发失败。
+## 超时、错误与恢复边界
 
-## 我加了什么、为什么加
+- 每个候选帧从首个 `AA` 开始计时，后续字节不延长截止时间。
+  如果头部被噪声打断后重新出现 `AA`，新候选帧获得新的计时窗口。
+- 超时在 `feed()` 入口或 `tick()` 中检查，`tick()` 返回丢弃字节数。
+  截止时刻及之后到达的尾部会按超时处理。
+- CRC 错误丢弃当前长度字段指定的整个候选帧，不回扫其内部帧头。
+- 超时丢弃当前残帧。普通垃圾立即计入 `discarded`，仅保留可能跨块的 `AA`。
+- `frames` 为成功帧数；`crc_errors` 为完整候选帧 CRC 失败数；
+  `discarded` 包括噪声、CRC 失败帧和超时字节；`timeouts` 为超时事件数。
+- `reset()` 清空缓冲和统计；保留超时配置。解析器需要串行调用。
 
-模板版本只会「等下一块数据到齐」。这在真机上有个要命的失效模式。
+**恢复能力有边界**：长度字段损坏时，后续合法帧可能被当作当前帧内容并一同丢弃。
+超时也无法找回已经丢弃的帧。本协议不提供确认、重传、序列号或可靠交付保证；
+CRC 用于误码检测，不保证检测所有错误。需要可靠交付时，应在上层设计相应机制。
 
-### 问题：半帧会永久堵死解析器
+## 验证内容
 
-假设对端发了一帧，`LEN=0x09`，结果只发出 4 个字节就断线了。这 4 个字节停在缓冲区
-首位，`feed()` 每次进来发现「还差 5 字节」，就 `break` 等下一轮。之后对端恢复，发来
-一整帧合法数据——解析器仍然认为前面那半帧没结束，新帧被当成它的尾巴一起吃掉，
-CRC 校验失败，整段丢弃，然后继续等。**解析器一直在工作，但再也吐不出任何一帧。**
+- 原有 Python 测试保留，新增噪声、候选帧重新计时、参数与统计回归测试。
+- C/Python 各自覆盖 0–255 所有 payload 长度及每个两段拆包位置。
+- 固定种子的随机二进制 payload、随机分块及字节统计守恒检查。
+- C 测试覆盖空帧、最大帧、CRC 错帧后续帧、超时边界、滴流不续期、
+  `uint32_t` 毫秒时钟回绕、输出容量不足和非法指针组合。
+- C/Python 互操作测试比较所有长度的编码结果，并将 Python 帧逐字节交给 C 解码。
+- CI 配置 Python 3.9–3.13，以及 GCC/Clang 的 C 测试和 AddressSanitizer/UBSan。
+  新增工作流是否通过，应以 GitHub Actions 实际运行结果为准。
 
-这种半帧在串口上不是理论情况：MCU 复位、RS-485 收发器切换时拉低总线、LEN 字节被
-干扰打乱导致长度算错，都能造出来。模板没有兜底，等于把「链路抖动一次」放大成
-「进程重启才能恢复」。
+Linux/macOS 上启用互操作测试：
 
-### 做法
+```bash
+SF_VECTOR_TOOL=./build/sf_vector_tool python -m unittest discover -s tests -t . -v
+```
 
-- `FrameParser(timeout_ms=...)`，默认 `None` 保持原行为，原有 11 个测试一行没改。
-- 新增内部状态 `_waiting_since`：记录残字节**第一次**出现的时刻。
-- 新增计数器 `timeouts`；超时丢弃的字节同时计入已有的 `discarded`。
-- 新增 `tick()` 供调用方轮询，`feed()` 入口也会检查一次。
-- 时钟可注入：默认 `time.monotonic`，测试传假时钟。
+Windows PowerShell（多配置 CMake 生成器可能位于 `build/Debug/`）：
 
-### 三个想清楚才写对的点
+```powershell
+$env:SF_VECTOR_TOOL = (Resolve-Path ./build/sf_vector_tool.exe).Path
+python -m unittest discover -s tests -t . -v
+```
 
-**1. 谁来发现「没有数据」？**
-状态机的所有逻辑都挂在 `feed()` 上，而对端不发数据时 `feed()` 根本不会被调用——
-超时检查永远不会发生。这不是能靠内部再憋一个线程绕过去的（嵌入式场景里也不该那么做），
-只能由调用方在自己的读循环里每轮 `tick()` 一次。所以这条约束写进了 docstring 和上面的
-用法示例里，而不是让 `timeout_ms` 变成一个静默失效的开关。
+未设置 `SF_VECTOR_TOOL` 时仅跳过两项互操作测试，其他 Python 测试照常执行。
 
-**2. 计时起点不能刷新。**
-第一版写成每次 `feed()` 都把 `_waiting_since` 更新成当前时间，结果一字节一字节慢慢挤的
-设备永远超时不了：每来一个新字节就给残帧续命一次。改成只在缓冲区从空变非空时打点，
-`test_stamp_not_refreshed_by_drip` 就是钉这个行为的。
+## MCU 接入与项目展示
 
-**3. 超时后整段丢弃，不尝试重新同步。**
-和 CRC 失败时的处理保持一致：payload 里可能出现任意字节，在缓冲区内部扫 `0xAA 0x55`
-只会把真正的数据当成帧头，制造更多误判。宁可丢掉这半帧，让下一帧从干净的缓冲区开始。
-边界也划清了：只有「缓冲区里已有残字节」才可能超时，空缓冲区不产生超时，否则每轮
-`tick()` 都会凭空 +1。
+- [移植说明及硬件验收步骤](docs/embedded-porting.md)
+- [项目经历表述与面试准备](docs/resume-and-interview.md)
 
-## 设计取舍
-
-- **不依赖 `pyserial`**：只做编解码，收发交给调用方，方便在任何环境测试。
-- **解析器有状态**：不要求一次喂完整帧，这是它能处理半包的前提。
-- **CRC 不匹配时整帧丢弃**：不尝试重同步到帧内，因为 payload 里可能出现任意字节。
-- **超时需要调用方配合轮询**：库不自己起线程、不读时钟之外的资源，保持单线程可预测。
+推荐下一步选择手头开发板，接入 UART 中断或 DMA 接收，并保存故障注入日志。
+这能为项目增加板端实现和测量证据。
 
 ## License
 

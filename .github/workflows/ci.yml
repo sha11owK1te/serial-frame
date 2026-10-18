@@ -24,3 +24,27 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -t . -v
+
+  c-and-interop:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      CC: ${{ matrix.compiler }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build C99 with address and undefined behavior sanitizers
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+      - name: Verify C and Python interoperability
+        env:
+          SF_VECTOR_TOOL: ./build/sf_vector_tool
+        run: python -m unittest discover -s tests -t . -v

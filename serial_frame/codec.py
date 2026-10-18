@@ -17,6 +17,7 @@ CRC 为 CRC-16/MODBUS，覆盖 LEN + PAYLOAD。
 from __future__ import annotations
 
 import time
+import math
 
 HEAD = b"\xAA\x55"
 MAX_PAYLOAD = 255
@@ -69,9 +70,9 @@ class FrameParser:
 
     def __init__(self, timeout_ms: float = None, clock=None) -> None:
         if timeout_ms is not None:
-            if timeout_ms <= 0:
-                raise ValueError("timeout_ms must be positive")
             self.timeout_ms = float(timeout_ms)
+            if not math.isfinite(self.timeout_ms) or self.timeout_ms <= 0:
+                raise ValueError("timeout_ms must be finite and positive")
         else:
             self.timeout_ms = None
 
@@ -121,6 +122,8 @@ class FrameParser:
         return dropped
 
     def feed(self, data: bytes) -> list:
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("data must be bytes or bytearray")
         self._expire_if_stale()
         self._buf.extend(data)
         out = []
@@ -129,15 +132,19 @@ class FrameParser:
             start = self._buf.find(HEAD)
 
             if start < 0:
-                # 完全没有帧头，只留最后一个字节（可能是 0xAA 的前半）
-                if len(self._buf) > 1:
-                    self.discarded += len(self._buf) - 1
-                    del self._buf[:-1]
+                # 只有 0xAA 才可能是跨块帧头；普通垃圾不能产生半帧超时。
+                keep = 1 if self._buf.endswith(HEAD[:1]) else 0
+                dropped = len(self._buf) - keep
+                if dropped:
+                    self.discarded += dropped
+                    del self._buf[:dropped]
+                    self._waiting_since = None
                 break
 
             if start > 0:
                 self.discarded += start
                 del self._buf[:start]
+                self._waiting_since = None
 
             if len(self._buf) < 3:
                 break  # 连长度字节都没收到
@@ -155,6 +162,7 @@ class FrameParser:
                 self.frames += 1
             else:
                 self.crc_errors += 1
+                self.discarded += total
 
             del self._buf[:total]
             self._waiting_since = None  # 一帧结束，剩余字节属于新的一帧
